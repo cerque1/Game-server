@@ -3,12 +3,23 @@
 #include <stdexcept>
 #include <random>
 #include <ctime>
+#include <chrono>
+
+#include "records.h"
 
 namespace model {
 using namespace std::literals;
 
+constexpr double EPSILON = 10e-6;
+
 bool operator==(const Coordinates& lhs, const Coordinates& rhs){
-    return lhs.x == rhs.x && lhs.y == rhs.y;
+    return std::abs(lhs.x - rhs.x) < EPSILON
+        && std::abs(lhs.y - rhs.y) < EPSILON;
+}
+
+bool operator==(const Speed& lhs, const Speed& rhs){
+    return std::abs(lhs.horizontal - rhs.horizontal) < EPSILON
+        && std::abs(lhs.vertical - rhs.vertical) < EPSILON;
 }
 
 void Map::AddOffice(Office office) {
@@ -47,15 +58,18 @@ double GenerateRandomDouble(int start, int end){
     return (std::rand() % ((start - end) * 10) + start * 10) / 10.; 
 }
 
-model::Coordinates GenerateRandomPointOnMap(const model::Map* map){
-    model::Map::Roads roads = map->GetRoads();
+model::Coordinates GenerateRandomPointOnMap(const model::Map& map){
+    model::Map::Roads roads = map.GetRoads();
 
-    srand(std::time(NULL));
     model::Road road = roads[rand() % roads.size()];
 
     model::Coordinates coords;
-    coords.x = road.GetStart().x == road.GetEnd().x ? road.GetStart().x : GenerateRandomDouble(road.GetStart().x, road.GetEnd().x);
-    coords.y = road.GetStart().y == road.GetEnd().y ? road.GetStart().y : GenerateRandomDouble(road.GetStart().y, road.GetEnd().y);
+    coords.x = road.GetStart().x == road.GetEnd().x ? 
+                                    road.GetStart().x : 
+                                    GenerateRandomDouble(std::min(road.GetStart().x, road.GetEnd().x), std::max(road.GetStart().x, road.GetEnd().x));
+    coords.y = road.GetStart().y == road.GetEnd().y ? 
+                                    road.GetStart().y : 
+                                    GenerateRandomDouble(std::min(road.GetStart().y, road.GetEnd().y), std::max(road.GetStart().y, road.GetEnd().y));
 
     return coords;
 }
@@ -72,7 +86,6 @@ Coordinates Map::CanGoToPoint(const Coordinates& A, const Coordinates& B, model:
     for(auto road : roads_){
         if(IsContainsInRoute(road, A)){
             includes_roads.push_back(road);
-
             if(IsContainsInRoute(road, B)){
                 return B;
             }
@@ -81,9 +94,11 @@ Coordinates Map::CanGoToPoint(const Coordinates& A, const Coordinates& B, model:
 
     Coordinates coord;
 
+    coord.x = A.x;
+    coord.y = A.y;
+
     switch (dir){
     case model::DirectionGeo::NORTH:
-        coord.x = A.x;
         for(auto road : includes_roads){
             if(coord.y > std::min(road.GetStart().y, road.GetEnd().y) - 0.4 &&
                 std::min(road.GetStart().x, road.GetEnd().x) - 0.4 <= coord.x && 
@@ -94,7 +109,6 @@ Coordinates Map::CanGoToPoint(const Coordinates& A, const Coordinates& B, model:
         }
         break;
     case model::DirectionGeo::SOUTH:
-        coord.x = A.x;
         for(auto road : includes_roads){
             if(coord.y < std::max(road.GetStart().y, road.GetEnd().y) + 0.4 
                 && std::min(road.GetStart().x, road.GetEnd().x) - 0.4 <= coord.x  
@@ -104,7 +118,6 @@ Coordinates Map::CanGoToPoint(const Coordinates& A, const Coordinates& B, model:
         }
         break;
     case model::DirectionGeo::WEST:
-        coord.y = A.y;
         for(auto road : includes_roads){
             if(coord.x > std::min(road.GetStart().x, road.GetEnd().x) - 0.4 
                 && std::min(road.GetStart().y, road.GetEnd().y) - 0.4 <= coord.y 
@@ -114,7 +127,6 @@ Coordinates Map::CanGoToPoint(const Coordinates& A, const Coordinates& B, model:
         }
         break;
     default:
-        coord.y = A.y;
         for(auto road : includes_roads){
             if(coord.x < std::max(road.GetStart().x, road.GetEnd().x) + 0.4
                 && std::min(road.GetStart().y, road.GetEnd().y) - 0.4 <= coord.y 
@@ -135,10 +147,14 @@ bool Map::IsContainsInRoute(const Road& road, const Coordinates& point) const{
 std::shared_ptr<Dog> GameSession::AddDog(std::string name, int id){
     Coordinates dog_coord;
     if(is_random_generate_){
-        dog_coord = generate_coords::GenerateRandomPointOnMap(map_);
+        dog_coord = generate_coords::GenerateRandomPointOnMap(*map_);
     }
     dogs_.insert(std::pair<int, std::shared_ptr<Dog>>(id, std::make_shared<Dog>(id, name, dog_coord)));
     return dogs_[id];
+}
+
+void GameSession::AddDog(uint64_t id, const Dog& dog){
+    dogs_[id] = std::make_shared<Dog>(dog);
 }
 
 std::vector<std::pair<int, std::string>> GameSession::GetPlayersInfo() const{
@@ -149,17 +165,42 @@ std::vector<std::pair<int, std::string>> GameSession::GetPlayersInfo() const{
     return ids_;
 }
 
-void GameSession::MakeActionsAtTime(int time){
+std::unordered_map<int, MoveInfo> GameSession::MakeActionsAtTime(int time){
+    std::unordered_map<int, MoveInfo> moves_info;
+
     for(auto [id, dog] : dogs_){
         Coordinates next_pos;
         next_pos.x = dog->GetCoords().x + dog->GetSpeed().horizontal * (time / 1000.);
         next_pos.y = dog->GetCoords().y + dog->GetSpeed().vertical * (time / 1000.);
         
         Coordinates move = map_->CanGoToPoint(dog->GetCoords(), next_pos, dog->GetDir());
+        Coordinates last_pos = dog->GetCoords();
+
+        if(last_pos == move && !dog->GetChangeDirInTick()){
+            dog->AddAfkTime(time);
+        }
+        else{
+            dog->ClearAfkTime();
+        }
+
+        dog->SetChangeDirInTick(false);
         dog->SetCoords(move);
         if(move != next_pos){
             dog->SetSpeed(Speed{0, 0});
         }
+
+        dog->AddPlayTime(time);
+        moves_info[dog->GetId()] = {last_pos, next_pos};
+    }
+
+    return moves_info;
+}
+
+void GameSession::EraseDogsById(std::vector<int> dogs_id, std::vector<domain::Record>& records){
+    for(int dog_id : dogs_id){
+        auto dog = dogs_[dog_id];
+        records.push_back(domain::Record{domain::RecordId::New(), dog->GetName(), dog->GetScore(), dog->GetPlayTime()});
+        dogs_.erase(dog_id);
     }
 }
 
@@ -168,6 +209,11 @@ const Map* Game::FindMap(const Map::Id& id) const noexcept {
         return &maps_.at(it->second);
     }
     return nullptr;
+}
+
+void Game::AddGameSession(GameSession&& game_sessoion){
+    game_sessions_.push_back(std::make_shared<GameSession>(std::move(game_sessoion)));
+    game_session_to_map_id_[Map::Id(game_sessoion.GetMapId())] = game_sessions_.size() - 1;
 }
 
 model::GameSession* Game::AddGameSession(std::string map_id){
@@ -185,10 +231,15 @@ model::GameSession* Game::FindGameSessionFromMapId(const Map::Id& id) const{
     return nullptr;
 }
 
-void Game::MakeActionsAtTime(int time){
+MapIdToMovesInfo Game::MakeActionsAtTime(int time){
+    MapIdToMovesInfo map_id_to_moves_info;
+
     for(auto game_session : game_sessions_){
-        game_session->MakeActionsAtTime(time);
+        std::unordered_map<int, MoveInfo> moves_info = game_session->MakeActionsAtTime(time);
+        map_id_to_moves_info[Map::Id(game_session->GetMapId())] = moves_info;
     }
+
+    return map_id_to_moves_info;
 }
 
 Map* Game::FindMapForGameSession(const Map::Id& id){
@@ -196,6 +247,17 @@ Map* Game::FindMapForGameSession(const Map::Id& id){
         return &maps_.at(it->second);
     }
     return nullptr;
+}
+
+std::vector<domain::Record> Game::EraseRetiredDogs(std::unordered_map<std::string, std::vector<int>> dogs_id){
+    std::vector<domain::Record> records_res;
+
+    for(auto [map_id, dogs_id_on_map] : dogs_id){
+        auto game_session_ = FindGameSessionFromMapId(model::Map::Id(map_id));
+        game_session_->EraseDogsById(dogs_id_on_map, records_res);
+    }
+
+    return records_res;
 }
 
 }  // namespace model

@@ -38,9 +38,7 @@ std::string MakeErrorMessage(const std::string& code, const std::string& message
 std::string_view GetContentType(std::string_view file){
     std::string extension(file.substr(file.find_last_of('.') + 1));
 
-    for(char& c : extension){
-        c = tolower(c);
-    }
+    std::transform(extension.begin(), extension.end(), extension.begin(), tolower);
 
     if(extension == "htm" || extension == "html") return ContentType::TEXT_HTML;
     else if(extension == "css") return ContentType::TEXT_CSS;

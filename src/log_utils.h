@@ -1,15 +1,17 @@
 #pragma once
 
-#include <boost/asio/ip/address.hpp>
-#include <boost/beast/http.hpp>
 #include <boost/log/core.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/log/expressions.hpp>
 #include <boost/log/utility/setup/file.hpp>
 #include <boost/log/utility/setup/common_attributes.hpp>
 #include <boost/log/utility/manipulators/add_value.hpp>
+#include <boost/asio/ip/address.hpp>
+#include <boost/beast/http.hpp>
 #include <boost/date_time.hpp>
 #include <boost/json.hpp>
+
+// #define BOOST_USE_WINAPI_VERSION BOOST_WINAPI_VERSION_WIN7
 
 namespace logging = boost::log;
 namespace keywords = boost::log::keywords;

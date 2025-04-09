@@ -18,11 +18,36 @@ namespace details{
     
 }
 
+Player::Player(const Player& other) 
+        : game_session_(other.game_session_)
+        , dog_(other.dog_)
+        , token_(other.token_){
+}
+
+Players::Players(const Players& other)
+        : players_(other.players_)
+        , token_to_player(other.token_to_player)
+        , next_id_(other.next_id_){
+}
+
+Players& Players::operator=(const Players& other){
+    players_ = other.players_;
+    token_to_player = other.token_to_player;
+    next_id_ = other.next_id_;
+    return *this;
+}
+
+void Players::AddPlayer(std::string map_id, std::string token, int player_id, const players::Player& player){
+    std::shared_ptr<players::Player> player_ptr = std::make_shared<players::Player>(player);
+    players_[map_id][player_id] = player_ptr;
+    token_to_player[players::Token{token}] = player_ptr;
+}
+
 Player* Players::AddPlayer(std::string dog_name, model::GameSession* game_session){
     Token token = token_generator_.GenerateToken();
-    std::shared_ptr<Player> player = std::make_shared<Player>(game_session, game_session->AddDog(dog_name, next_id), token);
+    std::shared_ptr<Player> player = std::make_shared<Player>(game_session, game_session->AddDog(dog_name, next_id_), token);
     token_to_player[token] = player;
-    players_[game_session->GetMapId()][++next_id] = player;
+    players_[game_session->GetMapId()][next_id_++] = player;
     return &*player;
 }
 
@@ -40,6 +65,31 @@ Player* Players::FindByToken(Token token){
         return &*token_to_player[token];
     }
     return nullptr;
+}
+
+std::unordered_map<std::string, std::vector<int>> Players::EraseRetiredPlayers(int retires_time){
+    std::unordered_map<std::string, std::vector<int>> retired_dogs_id;
+
+    for(auto [map_id, players_on_map] : players_){
+        for(auto [player_id, player] : players_on_map){
+            if(player->IsRetired(retires_time)){
+                retired_dogs_id[map_id].push_back(player->GetId());
+                token_to_player.erase(player->GetToken());
+            }
+        }
+    }
+
+    for(auto [map_id, erased_players] : retired_dogs_id){
+        for(auto player_id : erased_players){
+            players_[map_id].erase(player_id);
+        }
+    }
+
+    return retired_dogs_id;
+}
+
+const std::unordered_map<std::string, std::unordered_map<int, std::shared_ptr<Player>>>& Players::GetPlayers() const{
+    return players_;
 }
 
 }

@@ -1,16 +1,19 @@
 #include "sdk.h"
 #include "log_utils.h"
 
+#include <boost/log/utility/setup/console.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/signal_set.hpp>
 #include <boost/json.hpp>
-#include <boost/log/utility/setup/console.hpp>
 #include <boost/program_options.hpp>
 #include <iostream>
 #include <thread>
 
+// #define BOOST_USE_WINAPI_VERSION _WIN32_WINNT
+
 #include "json_loader.h"
 #include "request_handler.h"
+#include "postgres.h"
 
 using namespace std::literals;
 namespace net = boost::asio;
@@ -78,6 +81,8 @@ struct Args{
     std::string config_file;
     std::string root_path; 
     bool is_random_generate;
+    std::string snapshoot_path;
+    int save_state_period;
 };
 
 [[nodiscard]] std::optional<Args> ParseCommandLine(int argc, const char* const argv[]){
@@ -91,7 +96,9 @@ struct Args{
         ("tick-period,t", po::value(&args.milliseconds)->value_name("milliseconds"), "set tick period")
         ("config-file,c", po::value(&args.config_file)->value_name("file"), "set config file path")
         ("www-root,w", po::value(&args.root_path)->value_name("dir"), "set static files root")
-        ("randomize-spawn-points", "spawn dogs at random positions");
+        ("randomize-spawn-points", "spawn dogs at random positions")
+        ("state-file", po::value(&args.snapshoot_path)->value_name("state_file"))
+        ("save-state-period", po::value(&args.save_state_period)->value_name("save_state_period"));
 
     po::variables_map vm;
     po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -111,7 +118,14 @@ struct Args{
     if (!vm.contains("www-root"s)) {
         throw std::runtime_error("Www-root file path is not specified"s);
     }
-
+    if(!vm.contains("save-state-period")){
+        args.save_state_period = 0;
+    }
+    if(!vm.contains("state-file"s)){
+        args.snapshoot_path = "";
+        args.save_state_period = 0;
+    }
+    
     if (!vm.contains("randomize-spawn-points"s)) {
         args.is_random_generate = false;
     }
@@ -141,9 +155,9 @@ int main(int argc, const char* argv[]) {
     try {
         if(auto args = ParseCommandLine(argc, argv)){
             // 1. Загружаем карту из файла и построить модель игры
-            model::Game game = json_loader::LoadGame(fs::path(args->config_file));
+            srand(std::time(NULL));
+            json_loader::GameInfo game_info = json_loader::LoadGame(fs::path(args->config_file));
 
-            // 2. Инициализируем io_context
             const unsigned num_threads = std::thread::hardware_concurrency();
             net::io_context ioc(num_threads);
 
@@ -161,7 +175,19 @@ int main(int argc, const char* argv[]) {
             // 4. Создаём обработчик HTTP-запросов и связываем его с моделью игры
             Strand api_strand = boost::asio::make_strand(ioc);
 
-            std::shared_ptr<http_handler::RequestHandler> handler = std::make_shared<http_handler::RequestHandler>(game, fs::path(args->root_path), api_strand, args->milliseconds, args->is_random_generate);
+            extra_data::LostObjectsOnMaps lost_objects_on_maps(game_info.possible_loot);
+
+            std::shared_ptr<serializing_listener::SerializingListener> listener = args->snapshoot_path.empty() ? nullptr
+                                                                                    : std::make_shared<serializing_listener::SerializingListener>
+                                                                                    (args->save_state_period * 1ms, args->snapshoot_path);
+
+            const char* db_url = std::getenv("GAME_DB_URL");
+            std::shared_ptr<postgres::Database> db = std::make_shared<postgres::Database>(num_threads, db_url);
+
+            std::shared_ptr<http_handler::RequestHandler> handler = std::make_shared<http_handler::RequestHandler>(game_info.game, lost_objects_on_maps
+                                                                        , fs::path(args->root_path), api_strand, args->milliseconds, args->is_random_generate
+                                                                        , dynamic_cast<serializing_listener::ApplicationListener*>(&*listener)
+                                                                        , db, game_info.retired_time);
 
             if(args->milliseconds > 0){
                 auto ticker = std::make_shared<Ticker>(api_strand, std::chrono::milliseconds(args->milliseconds), [&handler](std::chrono::milliseconds delta){
@@ -178,7 +204,6 @@ int main(int argc, const char* argv[]) {
                 (*handler)(std::forward<decltype(req)>(req), std::forward<decltype(send)>(send));
             });
 
-            // Эта надпись сообщает тестам о том, что сервер запущен и готов обрабатывать запросы
             logging::add_console_log(std::clog, keywords::format = &formatter::JsonFormatter);
 
             BOOST_LOG_TRIVIAL(info) << logging::add_value(timestamp, boost::posix_time::second_clock::local_time())
@@ -189,6 +214,13 @@ int main(int argc, const char* argv[]) {
             RunWorkers(std::max(1u, num_threads), [&ioc] {
                 ioc.run();
             });
+
+            if(!args->snapshoot_path.empty()){
+                std::filesystem::path temp_path = std::filesystem::weakly_canonical(args->snapshoot_path + "/../temp");
+                std::ofstream temp_file(temp_path, std::ios::binary);
+                serialization::MakeModelSerialize(temp_file, handler->GetGame(), handler->GetPlayers(), handler->GetLostObjects());
+                std::filesystem::rename(temp_path, args->snapshoot_path);
+            }
         }
     } catch (const std::exception& ex) {
         std::cerr << ex.what() << std::endl;

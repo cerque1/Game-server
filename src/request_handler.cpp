@@ -10,7 +10,7 @@ using value_type = json::object::value_type;
 namespace details{
 
     int HexToDec(std::string num){
-        int dec;
+        unsigned dec;
         sscanf(num.c_str(), "%x", &dec);
         return dec;
     }

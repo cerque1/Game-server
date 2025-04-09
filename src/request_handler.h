@@ -54,14 +54,15 @@ class LoggingRequestHandle {
         }
 
         BOOST_LOG_TRIVIAL(info) << logging::add_value(timestamp, boost::posix_time::second_clock::local_time())
-                            << logging::add_value(additional_data, log_data::MakeResponseSendData(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - start_handle).count(),
-                                                                             static_cast<boost::beast::http::status>(response.result_int()), content_type))
+                            << logging::add_value(additional_data, log_data::MakeResponseSendData(
+                                        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - start_handle).count(),
+                                        static_cast<boost::beast::http::status>(response.result_int()), content_type))
                             << "response sent";
     }
 
     void LogResponse();
 public:
-    LoggingRequestHandle(const Response& response_) : response_(response_), start_handle(std::chrono::system_clock::now()){}
+    explicit LoggingRequestHandle(const Response& response) : response_(response), start_handle(std::chrono::system_clock::now()){}
 
     ~LoggingRequestHandle(){
         LogResponse();
@@ -76,41 +77,48 @@ class RequestHandler : public std::enable_shared_from_this<RequestHandler> {
 public:
     using Strand = boost::asio::strand<boost::asio::io_context::executor_type>;
 
-    explicit RequestHandler(model::Game& game, fs::path&& root, Strand api_strand, int milliseconds, bool is_random_generate)
-        : api_request_handler_(game, milliseconds, is_random_generate), root_(std::move(root)), api_strand_(api_strand) {}
+    explicit RequestHandler(model::Game& game
+                        , extra_data::LostObjectsOnMaps& lost_objects
+                        , fs::path&& root, Strand api_strand
+                        , int milliseconds
+                        , bool is_random_generate
+                        , serializing_listener::ApplicationListener* app_listener
+                        , std::shared_ptr<postgres::Database> db
+                        , int retired_time)
+                : api_request_handler_(game, lost_objects, milliseconds, is_random_generate, app_listener, db, retired_time)
+                , root_(std::move(root)), api_strand_(api_strand) {}
 
     RequestHandler(const RequestHandler&) = delete;
     RequestHandler& operator=(const RequestHandler&) = delete;
 
     template <typename Body, typename Allocator, typename Send>
     void operator()(http::request<Body, http::basic_fields<Allocator>>&& req, Send&& send){
-        StringRequest request(std::forward<decltype(req)>(req));
+        StringRequest request(req);
 
         std::string target{DecodingURI(request.target())};
-        fs::path full_path = fs::weakly_canonical(fs::path(root_.string() + target));
+        fs::path full_endpoint = fs::weakly_canonical(fs::path(root_.string() + target));
 
         //Проверка нахождения пути в корневом каталоге
-        if(!api::details::IsSubPath(full_path.string(), root_.string())){
+        if(!api::details::IsSubPath(full_endpoint.string(), root_.string())){
             Response response;
             {
                 LoggingRequestHandle logger_(response);
                 response = request_handle_utils::MakeStringResponse(http::status::bad_request, "BadRequest"sv, request.version(), 
                                                     request.keep_alive(), ContentType::TEXT);
             }
-            return SendResponse(std::move(response), std::move(send));
+            return SendResponse(std::move(response), std::forward<Send>(send));
         }
         //Обработка Api запросов
         else if(api::details::IsSubPath(target, "/api"s)){
             target = target.substr(target.find_first_of('/', 1));
 
-            auto handler = [self = shared_from_this(), request, target, send] {
+            auto handler = [self = shared_from_this(), request, target, send = std::forward<Send>(send)] {
                 Response response;
                 {
                     LoggingRequestHandle logger_(response);
                     response = self->api_request_handler_.HandleRequest(request, target);
-
                 }
-                return self->SendResponse(std::move(response), std::move(send));
+                return self->SendResponse(std::move(response), send);
             };
 
             return boost::asio::dispatch(api_strand_, handler);
@@ -139,7 +147,7 @@ public:
                                                         request.keep_alive(), request_handle_utils::GetContentType(target));
                 }
             }
-            return SendResponse(std::move(response), std::move(send));
+            return SendResponse(std::move(response), std::forward<Send>(send));
         }
     }
 
@@ -147,10 +155,21 @@ public:
         api_request_handler_.Tick(delta);
     }
 
+    const model::Game& GetGame(){
+        return api_request_handler_.GetGame();
+    }
+
+    const players::Players& GetPlayers(){
+        return api_request_handler_.GetPlayers();
+    }
+
+    const extra_data::LostObjectsOnMaps& GetLostObjects(){
+        return api_request_handler_.GetLostObjects();
+    }
+
 private:
     FileResponse MakeFileResponse(http::status status, http::file_body::value_type body, unsigned http_version, 
                                       bool active_alive, std::string_view content_type);
-
     std::string DecodingURI(std::string_view uri);
     
     template <typename Send>

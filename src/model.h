@@ -3,11 +3,16 @@
 #include <unordered_map>
 #include <vector>
 #include <map>
+#include <optional>
 #include <memory>
 
 #include "tagged.h"
+#include "collision_detector.h"
+#include "records.h"
 
 namespace model {
+
+using namespace std::literals;
 
 struct KeyLiterals{
     inline static const std::string x = "x";
@@ -41,6 +46,7 @@ struct Coordinates{
     double y = 0;
 
     Coordinates() = default;
+    Coordinates(double _x, double _y) : x(_x), y(_y) {}
 };
 
 bool operator==(const Coordinates& lhs, const Coordinates& rhs);
@@ -48,6 +54,24 @@ bool operator==(const Coordinates& lhs, const Coordinates& rhs);
 struct Speed{
     double horizontal = 0;
     double vertical = 0;
+};
+
+bool operator==(const Speed& lhs, const Speed& rhs);
+
+struct MoveInfo{
+    Coordinates start;
+    Coordinates end;
+};
+
+struct CollectedItem{
+    unsigned id;
+    unsigned type;
+};
+
+struct RecordInfo{
+    std::string name;
+    int score;
+    double playing_time;
 };
 
 enum DirectionGeo{
@@ -152,10 +176,11 @@ public:
     using Buildings = std::vector<Building>;
     using Offices = std::vector<Office>;
 
-    Map(Id id, std::string name, double dog_speed) noexcept
+    Map(Id id, std::string name, double dog_speed, int bag_capacity) noexcept
         : id_(std::move(id))
         , name_(std::move(name))
-        , dog_speed_(dog_speed) {
+        , dog_speed_(dog_speed)
+        , bag_capacity_(bag_capacity) {
     }
 
     const Id& GetId() const noexcept {
@@ -182,6 +207,10 @@ public:
         return dog_speed_;
     }
 
+    int GetBagCapacity() const noexcept{
+        return bag_capacity_;
+    }
+
     void AddRoad(const Road& road) {
         roads_.emplace_back(road);
     }
@@ -205,6 +234,7 @@ private:
     Buildings buildings_;
 
     double dog_speed_;
+    int bag_capacity_;
 
     OfficeIdToIndex warehouse_id_to_index_;
     Offices offices_;
@@ -212,23 +242,29 @@ private:
 
 class Dog{ 
 public:
+    Dog() = default;
+
     Dog(int id, std::string name, Coordinates coords) : id_(id), name_(name), coords_(coords){
         dir_ = DirectionGeo::NORTH;
     }
 
-    int GetId(){
+    int GetId() const{
         return id_;
     }
-    std::string GetName(){
+    std::string GetName() const{
         return name_;
     }
 
-    Coordinates GetCoords(){
+    Coordinates GetCoords() const{
         return coords_;
     }
 
-    Speed GetSpeed(){
+    Speed GetSpeed() const{
         return speed_;
+    }
+    
+    DirectionGeo GetDir() const{
+        return dir_;
     }
 
     void SetSpeed(const Speed& new_speed){
@@ -241,10 +277,61 @@ public:
 
     void SetDir(const DirectionGeo& dir){
         dir_ = dir;
+        if(dir != DirectionGeo::NONE){
+            is_change_direction_in_tick_ = true;
+        }
     }
 
-    DirectionGeo GetDir(){
-        return dir_;
+    void AddCollectedItemToBag(CollectedItem collected_item){
+        bag_.push_back(std::move(collected_item));
+    }
+
+    size_t GetBagSize() const{
+        return bag_.size();
+    }
+
+    const std::vector<CollectedItem>& GetBag() const{
+        return bag_;
+    }
+
+    int GetScore() const{
+        return score_;
+    }
+
+    void AddScore(int value){
+        score_ += value;
+    }
+
+    void ClearBag(){
+        bag_.clear();
+    }
+
+    int GetAfkTime() const{
+        return afk_time_;
+    }
+
+    void AddAfkTime(int afk_time){
+        afk_time_ += afk_time;
+    }
+
+    void ClearAfkTime() {
+        afk_time_ = 0;
+    }
+
+    int GetPlayTime() const{
+        return play_time_;
+    }
+
+    void AddPlayTime(int play_time){
+        play_time_ += play_time;
+    }
+
+    bool GetChangeDirInTick() const{
+        return is_change_direction_in_tick_;
+    }
+
+    void SetChangeDirInTick(bool change_dir_in_tick){
+        is_change_direction_in_tick_ = change_dir_in_tick;
     }
 
 private:
@@ -253,12 +340,17 @@ private:
     Coordinates coords_;
     Speed speed_;
     DirectionGeo dir_;
+    std::vector<CollectedItem> bag_;
+    int score_ = 0;
+    int afk_time_ = 0;
+    int play_time_ = 0;
+    bool is_change_direction_in_tick_ = false;
 };
 
 namespace generate_coords{
 
 double GenerateRandomDouble(int start, int end);
-Coordinates GenerateRandomPointOnMap(const Map* map);
+Coordinates GenerateRandomPointOnMap(const Map& map);
 
 } // generate_coords
 
@@ -269,6 +361,8 @@ public:
     GameSession(const Map* map, bool is_random_generate) : map_(map), is_random_generate_(is_random_generate){}
 
     std::shared_ptr<Dog> AddDog(std::string name, int id);
+    
+    void AddDog(uint64_t id, const Dog& dog);
 
     std::string GetMapId() const{
         return *(map_->GetId());
@@ -284,7 +378,21 @@ public:
         return dogs_;
     }
 
-    void MakeActionsAtTime(int time);
+    int GetDogsCount() const {
+        return dogs_.size();
+    }
+
+    bool GetIsRandomGenerate() const { 
+        return is_random_generate_;
+    }
+
+    const Map* GetMap() const {
+        return map_;
+    }
+
+    std::unordered_map<int, MoveInfo> MakeActionsAtTime(int time);
+
+    void EraseDogsById(std::vector<int> dogs_id, std::vector<domain::Record>& records);
     
 private:
     bool is_random_generate_;
@@ -292,9 +400,12 @@ private:
     std::unordered_map<std::uint64_t, std::shared_ptr<Dog>> dogs_;
 };
 
+using MapIdToMovesInfo = std::unordered_map<Map::Id, std::unordered_map<int, MoveInfo>, util::TaggedHasher<Map::Id>>;
+
 class Game {
 public:
     using Maps = std::vector<Map>;
+    Game() = default;
 
     void AddMap(Map map);
 
@@ -304,15 +415,23 @@ public:
 
     const Map* FindMap(const Map::Id& id) const noexcept;
 
+    void AddGameSession(GameSession&& game_sessoion);
     model::GameSession* AddGameSession(std::string map_id);
 
     model::GameSession* FindGameSessionFromMapId(const Map::Id& id) const;
 
-    void MakeActionsAtTime(int time = 1);
+    const std::vector<std::shared_ptr<GameSession>>& GetGameSession() const{
+        return game_sessions_;
+    }
+
+    MapIdToMovesInfo MakeActionsAtTime(int time = 1);
 
     void SetRandomGenerate(bool is_random_generate){
         is_random_generate_ = is_random_generate;
     }
+
+    // возвращает результаты удаленных игроков
+    std::vector<domain::Record> EraseRetiredDogs(std::unordered_map<std::string, std::vector<int>> dogs_id);
 
 private:
     using MapIdHasher = util::TaggedHasher<Map::Id>;

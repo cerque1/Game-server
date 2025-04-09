@@ -1,6 +1,8 @@
 #include "api_request_handler.h"
+#include "log_utils.h"
 
 #include <boost/json.hpp>
+#include <boost/archive/binary_iarchive.hpp>
 
 namespace api_request_handler{
 
@@ -20,66 +22,6 @@ namespace details{
         }
         return true;
     }  
-
-    UserInfo GetUserInfoFromJson(std::string json_doc){
-        auto value = boost::json::parse(json_doc).as_object();
-        std::string user_name = std::string(value.at("userName").as_string());
-        std::string map_id = std::string(value.at("mapId").as_string());
-        return UserInfo{user_name, map_id};
-    } 
-
-    json::array GetRoads(const model::Map::Roads& roads){
-        json::array roads_obj;
-
-        for(auto road : roads){
-            json::object road_info;
-            road_info.insert(value_type("x0", road.GetStart().x));
-            road_info.insert(value_type("y0", road.GetStart().y));
-
-            if(road.IsHorizontal()){
-                road_info.insert(value_type("x1", road.GetEnd().x));
-            }
-            else{
-                road_info.insert(value_type("y1", road.GetEnd().y));
-            }
-
-            roads_obj.push_back(road_info);
-        }
-        return roads_obj;
-    }
-
-    json::array GetBuildings(const model::Map::Buildings& buildings){
-        json::array buildings_obj;
-
-        for(auto building : buildings){
-            json::object building_info;
-
-            building_info.insert(value_type(model::KeyLiterals::x, building.GetBounds().position.x));
-            building_info.insert(value_type(model::KeyLiterals::y, building.GetBounds().position.y));
-            building_info.insert(value_type(model::KeyLiterals::w, building.GetBounds().size.width));
-            building_info.insert(value_type(model::KeyLiterals::h, building.GetBounds().size.height));
-
-            buildings_obj.push_back(building_info);
-        }
-        return buildings_obj;
-    }
-
-    json::array GetOffices(const model::Map::Offices& offices){
-        json::array offices_obj;
-
-        for(auto office : offices){
-            json::object office_info;
-
-            office_info.insert(value_type("id", *office.GetId()));
-            office_info.insert(value_type(model::KeyLiterals::x, office.GetPosition().x));
-            office_info.insert(value_type(model::KeyLiterals::y, office.GetPosition().y));
-            office_info.insert(value_type("offsetX", office.GetOffset().dx));
-            office_info.insert(value_type("offsetY", office.GetOffset().dy));
-
-            offices_obj.push_back(office_info);
-        }
-        return offices_obj;
-    }
 
     std::string ConvertGeoDirToMoveDir(model::DirectionGeo geo){
         switch (geo){
@@ -112,37 +54,13 @@ namespace details{
         }
     }
 
-    std::optional<std::string> GetMoveDirection(const std::string& request_body){
-        json::value move;
-        try{
-            move = json::parse(request_body);
-        }catch(...){
-            return std::nullopt;
-        }
-
-        if(move.as_object().find("move") == move.as_object().end()){
-            return std::nullopt;
-        }
-        return std::string(move.as_object().at("move").as_string());
-    }
-
-    std::optional<int> GetTimeDeltaFromJson(const std::string& request_body){
-        try{
-            json::value time_delta = json::parse(request_body);
-            return time_delta.as_object().at("timeDelta").as_int64();
-        }catch(...){
-            return std::nullopt;
-        }
-    }
-
-    model::Speed MoveDirectionToSpeed(std::string move_dir, double dog_speed){
-        if(move_dir.empty()){
+    model::Speed MoveDirectionToSpeed(char move_dir, double dog_speed){
+        if(move_dir == '\0'){
             return model::Speed{0, 0};
         }
 
-        char dir = move_dir[0];
         model::Speed dog_dir_speed_;
-        switch (dir){
+        switch (move_dir){
         case 'U':
             dog_dir_speed_.vertical = -dog_speed;
             break;
@@ -155,6 +73,8 @@ namespace details{
         case 'R': 
             dog_dir_speed_.horizontal = dog_speed;
             break;
+        default:
+            assert(false);
         }
 
         return dog_dir_speed_;
@@ -241,8 +161,52 @@ namespace details{
     }
 } // details
 
-ApiRequestHandler::ApiRequestHandler(model::Game& game, int milliseconds, bool is_random_generate) : game_(game){
-    game.SetRandomGenerate(is_random_generate);
+ApiRequestHandler::ApiRequestHandler(model::Game& game
+                        , extra_data::LostObjectsOnMaps& lost_objects
+                        , int milliseconds
+                        , bool is_random_generate
+                        , serializing_listener::ApplicationListener* app_listener
+                        , std::shared_ptr<postgres::Database> db
+                        , int retired_time)
+                        : game_(game), lost_objects_(lost_objects), app_listener_(app_listener), db_(db), retired_time_(retired_time){
+    game_.SetRandomGenerate(is_random_generate);
+    
+    if(app_listener_ != nullptr){
+        std::ifstream in_file(dynamic_cast<serializing_listener::SerializingListener*>(app_listener_)->GetPath(), std::ios::binary | std::ios::in);
+        if(in_file.is_open()){
+            try{
+                boost::archive::binary_iarchive ar{in_file};
+
+                std::vector<serialization::GameSessionRepr> game_sessions_repr;
+                serialization::PlayersRepr players_repr;
+                std::unordered_map<std::string, std::vector<serialization::LostObjectRepr>> lost_objects_repr;            
+
+                ar >> game_sessions_repr;
+                ar >> players_repr;
+                ar >> lost_objects_repr;
+
+                for(auto game_session_repr : game_sessions_repr){
+                    game_.AddGameSession(game_session_repr.Restore(game_, is_random_generate));
+                }
+                players_ = players_repr.Restore(game_);
+
+                std::unordered_map<std::string, std::vector<extra_data::LostObject>> lost_objs;
+                for(auto [map_id, lost_obj] : lost_objects_repr){
+                    lost_objs[map_id] = {};
+                    for(auto object : lost_obj){
+                        lost_objs[map_id].push_back(object.Restore());
+                    }
+                }
+                lost_objects_.SetLostObjectsOnMaps(std::move(lost_objs));
+            }
+            catch(std::exception& e){
+                BOOST_LOG_TRIVIAL(info) << logging::add_value(timestamp, boost::posix_time::second_clock::local_time())
+                                        << logging::add_value(additional_data, log_data::MakeServerExitedData(1, e.what()))
+                                        << "server exited with deserialize error";
+                throw e;
+            }
+        }
+    }
 
     if(milliseconds == 0){
         is_test_version = true;
@@ -270,9 +234,10 @@ std::string ApiRequestHandler::GetMapInfo(std::string_view id){
     map_obj.insert(value_type("id", *map->GetId()));
     map_obj.insert(value_type("name", map->GetName()));
 
-    map_obj.insert(value_type("roads", details::GetRoads(map->GetRoads())));    
-    map_obj.insert(value_type("buildings", details::GetBuildings(map->GetBuildings())));
-    map_obj.insert(value_type("offices", details::GetOffices(map->GetOffices())));
+    map_obj.insert(value_type("roads", GetRoads(map->GetRoads())));    
+    map_obj.insert(value_type("buildings", GetBuildings(map->GetBuildings())));
+    map_obj.insert(value_type("offices", GetOffices(map->GetOffices())));
+    map_obj.insert(value_type("lootTypes", GetLootTypes(lost_objects_.GetPossibleLootObjectsOnMap(std::string(id)))));
 
     return json::serialize(map_obj);
 }
@@ -298,10 +263,10 @@ std::string ApiRequestHandler::FormJsonPlayersMap(const std::vector<std::pair<in
     return json::serialize(players_json);
 }
 
-std::string ApiRequestHandler::FormJsonDogsInfo(const std::unordered_map<std::uint64_t, std::shared_ptr<model::Dog>>& dogs){
-    json::object players;
-    json::object dogs_json;
+std::string ApiRequestHandler::FormJsonMapInfo(const std::unordered_map<std::uint64_t, std::shared_ptr<model::Dog>>& dogs, const std::string& map_id){
+    json::object map_info;
 
+    json::object dogs_json;
     for(auto [id, dog] : dogs){
         json::object dog_info;
 
@@ -318,11 +283,53 @@ std::string ApiRequestHandler::FormJsonDogsInfo(const std::unordered_map<std::ui
         dog_info.insert(value_type("speed", speed));
 
         dog_info.insert(value_type("dir", details::ConvertGeoDirToMoveDir(dog->GetDir())));
+
+        json::array bag;
+        for(auto item : dog->GetBag()){
+            json::object item_object;
+            item_object.insert(value_type("id", item.id));
+            item_object.insert(value_type("type", item.type));
+
+            bag.push_back(item_object);
+        }
+
+        dog_info.insert(value_type("bag", bag));
+        dog_info.insert(value_type("score", dog->GetScore()));
+
         dogs_json.insert(value_type(std::to_string(id), dog_info));
     }
-    players.insert(value_type("players", dogs_json));
+    map_info.insert(value_type("players", dogs_json));
 
-    return json::serialize(players);
+    json::object lost_objects_json;
+    for(auto lost_obj : lost_objects_.GetLostObjects(map_id)){
+        json::object lost_obj_json;
+
+        json::array coords;
+        coords.push_back(lost_obj.coords.x);
+        coords.push_back(lost_obj.coords.y);
+
+        lost_obj_json.insert(value_type("pos", coords));
+        lost_obj_json.insert(value_type("type", lost_obj.type));
+        lost_objects_json.insert(value_type(std::to_string(lost_obj.id), lost_obj_json));
+    }
+    map_info.insert(value_type("lostObjects", lost_objects_json));
+
+    return json::serialize(map_info);
+}
+
+std::string ApiRequestHandler::FormRecords(int start, int max_items) const{
+    json::array records_json;
+
+    auto records = db_->GetRecordRepo()->GetRecords(start, max_items);
+    for(auto record : records){
+        json::object record_json;
+        record_json.insert(json::object::value_type("name", record.GetDogName()));
+        record_json.insert(json::object::value_type("score", record.GetScore()));
+        record_json.insert(json::object::value_type("playTime", record.GetTime()/1000.));
+        records_json.push_back(record_json);
+    }
+
+    return json::serialize(records_json);
 }
 
 StringResponse ApiRequestHandler::GetPlayers(const StringRequest& request){
@@ -352,10 +359,10 @@ StringResponse ApiRequestHandler::GetState(const StringRequest& request){
                 if(player == nullptr){
                     return details::MakeUnauthorizeError("unknownToken", "Player token has not been found", request.version(), request.keep_alive());
                 }
-
-                return request_handle_utils::MakeStringResponse(http::status::ok, FormJsonDogsInfo(player->GetGameSession()->GetDogs()),
+                
+                return request_handle_utils::MakeStringResponse(http::status::ok, FormJsonMapInfo(player->GetGameSession()->GetDogs(), player->GetMapId()),
                                                 request.version(), request.keep_alive(), request_handle_utils::ContentType::APPLICATION_JSON);
-            }, 
+            },
             request);
 }
 
@@ -374,12 +381,12 @@ StringResponse ApiRequestHandler::MakeAction(const StringRequest& request){
                     return details::MakeBadRequestError("invalidArgument", "Invalid content type", request.version(), request.keep_alive());
                 }
 
-                std::optional<std::string> dog_move_dir = details::GetMoveDirection(request.body());
+                std::optional<std::string> dog_move_dir = GetMoveDirection(request.body());
                 if(!details::IsValidActionBody(dog_move_dir)){
                     return details::MakeBadRequestError("invalidArgument", "Failed to parse action", request.version(), request.keep_alive());
                 }
 
-                model::Speed dog_speed = details::MoveDirectionToSpeed(*dog_move_dir,
+                model::Speed dog_speed = details::MoveDirectionToSpeed((*dog_move_dir)[0],
                                                                        player->GetGameSession()->GetMapDogSpeed());                
                 player->SetDogSpeed(dog_speed);
                 player->SetDogDir(details::ConvertCharToDir((*dog_move_dir)[0]));
@@ -395,10 +402,10 @@ StringResponse ApiRequestHandler::JoinPlayer(const StringRequest& request){
         return details::MakeNotAllowedMethodError("invalidMethod", "Only POST method is expected", request.version(), request.keep_alive(), "POST");
     }
 
-    details::UserInfo user_info;
+    UserInfo user_info;
     try{
-        user_info = details::GetUserInfoFromJson(request.body());
-    }catch(...){
+        user_info = GetUserInfoFromJson(request.body());
+    }catch(std::exception const& e){
         return details::MakeBadRequestError("invalidArgument", "Join game request parse error", request.version(), request.keep_alive());
     }
     if(user_info.name_.empty()){
@@ -439,6 +446,7 @@ StringResponse ApiRequestHandler::GetMapsResponse(const StringRequest& request, 
             }
         }
     }
+    return details::MakeNotAllowedMethodError("invalidMethod", "Invalid method", request.version(), request.keep_alive(), "GET, HEAD");
 }
 
 StringResponse ApiRequestHandler::SetTimeDelta(const StringRequest& request){
@@ -446,14 +454,38 @@ StringResponse ApiRequestHandler::SetTimeDelta(const StringRequest& request){
         return details::MakeNotAllowedMethodError("invalidMethod", "Only POST method is expected", request.version(), request.keep_alive(), "POST");
     }
 
-    std::optional<int> time_delta = details::GetTimeDeltaFromJson(request.body());
+    std::optional<int> time_delta = GetTimeDeltaFromJson(request.body());
     if(!time_delta.has_value()){
         return details::MakeBadRequestError("invalidArgument", "Failed to parse tick request JSON", request.version(), request.keep_alive());
     }
 
-    game_.MakeActionsAtTime(*time_delta);
+    Tick(*time_delta);
     return request_handle_utils::MakeStringResponse(http::status::ok, "{}",
                                                 request.version(), request.keep_alive(), request_handle_utils::ContentType::APPLICATION_JSON);
+}
+
+StringResponse ApiRequestHandler::GetRecords(const StringRequest& request, int start, int max_items) const{
+    if(start < 0 || max_items < 0 || max_items > 100){
+        return details::MakeBadRequestError("invalidArgument", "Invalid arguments", request.version(), request.keep_alive());
+    }
+    return request_handle_utils::MakeStringResponse(http::status::ok, FormRecords(start, max_items),
+                                                request.version(), request.keep_alive(), request_handle_utils::ContentType::APPLICATION_JSON);
+}
+
+void ApiRequestHandler::Tick(int delta){
+    auto moves_info = game_.MakeActionsAtTime(delta);
+    lost_objects_.GenerateLostObjectsOnMaps(delta, game_);
+    objects_collector::CollectObjects(game_, lost_objects_, moves_info);
+    auto retired_dogs_id = players_.EraseRetiredPlayers(retired_time_);
+    auto records_result = game_.EraseRetiredDogs(retired_dogs_id);
+
+    if(!records_result.empty()){
+        db_->GetRecordRepo()->SaveRecords(records_result);
+    }
+
+    if(app_listener_){
+        app_listener_->OnTick(delta * 1ms, game_, players_, lost_objects_);
+    }
 }
 
 } // api_request_handler
